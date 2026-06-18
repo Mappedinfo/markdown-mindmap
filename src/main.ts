@@ -348,7 +348,11 @@ class MindmapWorkbenchView extends ItemView {
     input.dataset.nodeId = node.id;
     input.value = node.title;
     input.placeholder = "Untitled";
-    input.addEventListener("focus", () => this.selectNode(node.id, false));
+    input.addEventListener("focus", () => {
+      this.selectedIds = new Set([node.id]);
+      card.addClass("is-selected");
+      select.checked = true;
+    });
     input.addEventListener("blur", () => this.commitTitle(node.id, input.value));
     input.addEventListener("keydown", (event) => this.handleNodeKeydown(event, node.id, input));
   }
