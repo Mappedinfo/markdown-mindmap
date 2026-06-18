@@ -1,6 +1,6 @@
 {
-  "name": "local-obsidian-mindmap",
-  "version": "0.1.0",
+  "name": "markdown-mindmap",
+  "version": "0.1.1",
   "type": "module",
   "private": true,
   "main": "main.js",

@@ -1,4 +1,4 @@
-# Local Obsidian Mindmap
+# Markdown Mindmap
 
 Editable mindmap workbench for plain Markdown outline blocks in Obsidian.
 

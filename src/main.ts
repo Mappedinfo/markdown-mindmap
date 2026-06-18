@@ -31,7 +31,7 @@ import {
   type OutlineOperationResult
 } from "./outline.ts";
 
-const VIEW_TYPE_MINDMAP = "local-obsidian-mindmap-workbench";
+const VIEW_TYPE_MINDMAP = "markdown-mindmap-workbench";
 
 interface LocalMindmapSettings {
   indentUnit: number;

@@ -6,7 +6,7 @@ const production = process.argv.includes("--production");
 
 await esbuild.build({
   banner: {
-    js: "/* Local Obsidian Mindmap */"
+    js: "/* Markdown Mindmap */"
   },
   entryPoints: ["src/main.ts"],
   bundle: true,

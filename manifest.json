@@ -1,7 +1,7 @@
 {
-  "id": "local-obsidian-mindmap",
-  "name": "Local Obsidian Mindmap",
-  "version": "0.1.0",
+  "id": "markdown-mindmap",
+  "name": "Markdown Mindmap",
+  "version": "0.1.1",
   "minAppVersion": "1.5.0",
   "description": "Editable mindmap workbench for Markdown outline blocks.",
   "author": "mappedinfo",
