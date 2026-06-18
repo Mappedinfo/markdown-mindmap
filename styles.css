@@ -135,6 +135,50 @@
   flex-direction: column;
 }
 
+.local-mindmap-overview {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px;
+}
+
+.local-mindmap-block {
+  border: 1px solid var(--mindmap-border);
+  border-radius: 8px;
+  background: var(--background-primary);
+  margin-bottom: 12px;
+  overflow: hidden;
+}
+
+.local-mindmap-block.is-active {
+  border-color: var(--mindmap-accent);
+  box-shadow: 0 0 0 2px rgba(15, 118, 110, 0.12);
+}
+
+.local-mindmap-block-header {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 10px;
+  border-bottom: 1px solid var(--mindmap-border);
+  background: var(--background-secondary);
+}
+
+.local-mindmap-block-title {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--mindmap-strong);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-mindmap-block-meta {
+  font-size: 11px;
+  color: var(--mindmap-muted);
+}
+
 .local-mindmap-toolbar {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto auto auto;
@@ -200,6 +244,12 @@
     linear-gradient(90deg, var(--background-modifier-border) 1px, transparent 1px);
   background-size: 28px 28px;
   background-color: var(--mindmap-bg);
+}
+
+.local-mindmap-block-stage {
+  height: 340px;
+  min-height: 260px;
+  flex: unset;
 }
 
 .local-mindmap-surface {

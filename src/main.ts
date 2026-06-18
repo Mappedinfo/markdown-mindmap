@@ -348,8 +348,10 @@ export default class MarkdownMindmapPlugin extends Plugin {
 
 class MindmapWorkbenchView extends ItemView {
   private sourceFile: TFile | null = null;
+  private blocks: MindmapBlock[] = [];
   private block: MindmapBlock | null = null;
   private nodes: OutlineNode[] = [];
+  private fileState: MindmapStateData = { schemaVersion: 1, blocks: {} };
   private selectedIds = new Set<string>();
   private collapsedIds = new Set<string>();
   private scale = 1;
@@ -427,11 +429,13 @@ class MindmapWorkbenchView extends ItemView {
 
   focusSelectedNode(): void {
     const id = [...this.selectedIds][0];
-    if (!id) {
+    if (!id || !this.block) {
       new Notice("No mindmap node selected.");
       return;
     }
-    const input = this.contentEl.querySelector<HTMLInputElement>(`input[data-node-id="${cssEscape(id)}"]`);
+    const input = this.contentEl.querySelector<HTMLInputElement>(
+      `input[data-block-id="${cssEscape(this.block.id)}"][data-node-id="${cssEscape(id)}"]`
+    );
     input?.focus();
     input?.select();
   }
@@ -456,6 +460,8 @@ class MindmapWorkbenchView extends ItemView {
     await this.plugin.refreshIndexForFile(file, markdown);
 
     this.sourceFile = file;
+    this.blocks = blocks;
+    this.fileState = readMindmapState(markdown);
     if (blocks.length === 0) {
       this.block = null;
       this.nodes = [];
@@ -470,7 +476,7 @@ class MindmapWorkbenchView extends ItemView {
     this.block = block;
     this.nodes = block.nodes;
     this.plugin.setActiveBlockForFile(file.path, block.id);
-    const state = readMindmapState(markdown).blocks[block.id];
+    const state = this.fileState.blocks[block.id];
     const previousSelection = new Set(this.selectedIds);
     this.collapsedIds = new Set(cache.activeBlockId === block.id ? cache.collapsedIds : state?.collapsedIds ?? []);
     this.scale = cache.activeBlockId === block.id ? cache.scale : state?.scale ?? 1;
@@ -489,7 +495,12 @@ class MindmapWorkbenchView extends ItemView {
     const markdown = await this.plugin.readMarkdownFile(this.sourceFile);
     await this.plugin.refreshIndexForFile(this.sourceFile, markdown);
     const blocks = parseMindmapBlocks(markdown, { sourcePath: this.sourceFile.path, fallbackTitle: this.sourceFile.basename });
+    this.blocks = blocks;
+    this.fileState = readMindmapState(markdown);
     if (!this.block) {
+      if (blocks.length > 0) {
+        this.activateBlock(blocks[0].id);
+      }
       this.render();
       return;
     }
@@ -576,12 +587,12 @@ class MindmapWorkbenchView extends ItemView {
     const titleGroup = toolbar.createDiv({ cls: "local-mindmap-heading" });
     titleGroup.createDiv({
       cls: "local-mindmap-title",
-      text: this.block?.title ?? this.sourceFile?.basename ?? "Markdown Mindmap"
+      text: this.sourceFile?.basename ?? "Markdown Mindmap"
     });
     titleGroup.createDiv({
       cls: "local-mindmap-subtitle",
-      text: this.block && this.sourceFile
-        ? `${this.sourceFile.path} · lines ${this.block.startLine + 1}-${this.block.endLine + 1}`
+      text: this.sourceFile && this.blocks.length > 0
+        ? `${this.sourceFile.path} · ${this.blocks.length} mindmap${this.blocks.length > 1 ? "s" : ""} rendered`
         : this.sourceFile
           ? `${this.sourceFile.path} · no mindmap block`
           : "Choose a mindmap or create one in the active file."
@@ -596,7 +607,7 @@ class MindmapWorkbenchView extends ItemView {
       container.createDiv({ cls: "local-mindmap-empty", text: "Open a Markdown file or choose a mindmap from the dashboard." });
       return;
     }
-    if (!this.block) {
+    if (this.blocks.length === 0) {
       const empty = container.createDiv({ cls: "local-mindmap-empty" });
       empty.createDiv({ text: "This file has no mindmap block." });
       const button = empty.createEl("button", { text: "Create mindmap in current file" });
@@ -604,15 +615,33 @@ class MindmapWorkbenchView extends ItemView {
       button.addEventListener("click", () => void this.plugin.createMindmapInCurrentFile(this.sourceFile ?? undefined));
       return;
     }
-    if (this.nodes.length === 0) {
-      container.createDiv({ cls: "local-mindmap-empty", text: "The selected mindmap block is empty." });
+
+    const overview = container.createDiv({ cls: "local-mindmap-overview" });
+    for (const block of this.blocks) {
+      this.renderMindmapBlock(overview, block);
+    }
+  }
+
+  private renderMindmapBlock(container: HTMLElement, block: MindmapBlock): void {
+    const active = this.block?.id === block.id;
+    const section = container.createDiv({ cls: active ? "local-mindmap-block is-active" : "local-mindmap-block" });
+    const header = section.createDiv({ cls: "local-mindmap-block-header" });
+    header.createDiv({ cls: "local-mindmap-block-title", text: block.title || block.rootTitle || "Untitled mindmap" });
+    header.createDiv({ cls: "local-mindmap-block-meta", text: `lines ${block.startLine + 1}-${block.endLine + 1}` });
+    if (block.warning) section.createDiv({ cls: "local-mindmap-warning", text: block.warning });
+
+    const blockNodes = active ? this.nodes : block.nodes;
+    if (blockNodes.length === 0) {
+      section.createDiv({ cls: "local-mindmap-empty", text: "This mindmap block is empty." });
       return;
     }
 
-    const stage = container.createDiv({ cls: "local-mindmap-stage" });
+    const collapsedIds = active ? this.collapsedIds : new Set(this.fileState.blocks[block.id]?.collapsedIds ?? []);
+    const stage = section.createDiv({ cls: "local-mindmap-stage local-mindmap-block-stage" });
     stage.scrollLeft = this.scrollLeft;
     stage.scrollTop = this.scrollTop;
     stage.addEventListener("scroll", () => {
+      if (!active) return;
       this.scrollLeft = stage.scrollLeft;
       this.scrollTop = stage.scrollTop;
       this.updateCache();
@@ -622,7 +651,7 @@ class MindmapWorkbenchView extends ItemView {
     const surface = stage.createDiv({ cls: "local-mindmap-surface" });
     surface.style.transform = `scale(${this.scale})`;
     surface.style.transformOrigin = "top left";
-    const layouts = layoutNodes(this.nodes, this.collapsedIds);
+    const layouts = layoutNodes(blockNodes, collapsedIds);
     const maxX = Math.max(...layouts.map((entry) => entry.x), 0) + 340;
     const maxY = Math.max(...layouts.map((entry) => entry.y), 0) + 140;
     surface.style.width = `${maxX}px`;
@@ -646,64 +675,69 @@ class MindmapWorkbenchView extends ItemView {
     }
 
     for (const layout of layouts) {
-      this.renderNode(surface, layout);
+      this.renderNode(surface, block, layout);
     }
 
     window.setTimeout(() => {
+      if (!active) return;
       stage.scrollLeft = this.scrollLeft;
       stage.scrollTop = this.scrollTop;
     }, 0);
   }
 
-  private renderNode(surface: HTMLElement, layout: NodeLayout): void {
+  private renderNode(surface: HTMLElement, block: MindmapBlock, layout: NodeLayout): void {
     const node = layout.node;
-    const selected = this.selectedIds.has(node.id);
+    const active = this.block?.id === block.id;
+    const selected = active && this.selectedIds.has(node.id);
     const card = surface.createDiv({ cls: selected ? "local-mindmap-node is-selected" : "local-mindmap-node" });
     card.style.left = `${layout.x}px`;
     card.style.top = `${layout.y}px`;
     card.addEventListener("click", (event) => {
       if ((event.target as HTMLElement).tagName === "INPUT" || (event.target as HTMLElement).tagName === "BUTTON") return;
-      this.selectNode(node.id, event.metaKey || event.ctrlKey || event.shiftKey);
+      this.selectNode(block.id, node.id, event.metaKey || event.ctrlKey || event.shiftKey);
     });
 
     const row = card.createDiv({ cls: "local-mindmap-node-row" });
     const select = row.createEl("input", { cls: "local-mindmap-select" });
     select.type = "checkbox";
     select.checked = selected;
-    select.addEventListener("change", () => this.selectNode(node.id, true));
+    select.addEventListener("change", () => this.selectNode(block.id, node.id, true));
 
-    const collapse = row.createEl("button", { cls: "local-mindmap-collapse", text: node.children.length > 0 ? (this.collapsedIds.has(node.id) ? "+" : "-") : "" });
+    const blockCollapsedIds = active ? this.collapsedIds : new Set(this.fileState.blocks[block.id]?.collapsedIds ?? []);
+    const collapse = row.createEl("button", { cls: "local-mindmap-collapse", text: node.children.length > 0 ? (blockCollapsedIds.has(node.id) ? "+" : "-") : "" });
     collapse.type = "button";
     collapse.disabled = node.children.length === 0;
     collapse.addEventListener("click", (event) => {
       event.preventDefault();
       event.stopPropagation();
-      this.toggleCollapse(node.id);
+      this.toggleCollapse(block.id, node.id);
     });
 
     const input = row.createEl("input", { cls: "local-mindmap-node-title" });
+    input.dataset.blockId = block.id;
     input.dataset.nodeId = node.id;
     input.value = node.title;
     input.placeholder = "Untitled";
     input.addEventListener("focus", () => {
+      this.activateBlock(block.id);
       this.selectedIds = new Set([node.id]);
       this.updateCache();
       card.addClass("is-selected");
       select.checked = true;
     });
-    input.addEventListener("blur", () => void this.commitTitle(node.id, input.value));
-    input.addEventListener("keydown", (event) => this.handleNodeKeydown(event, node.id, input));
+    input.addEventListener("blur", () => void this.commitTitle(block.id, node.id, input.value));
+    input.addEventListener("keydown", (event) => this.handleNodeKeydown(event, block.id, node.id, input));
   }
 
-  private handleNodeKeydown(event: KeyboardEvent, nodeId: string, input: HTMLInputElement): void {
+  private handleNodeKeydown(event: KeyboardEvent, blockId: string, nodeId: string, input: HTMLInputElement): void {
     if (event.key === "Enter") {
       event.preventDefault();
-      void this.commitTitle(nodeId, input.value, { skipRender: true }).then(() => this.applyOperation(insertSiblingAfter(this.nodes, nodeId, "")));
+      void this.commitTitle(blockId, nodeId, input.value, { skipRender: true }).then(() => this.applyOperation(insertSiblingAfter(this.nodes, nodeId, "")));
       return;
     }
     if (event.key === "Tab") {
       event.preventDefault();
-      void this.commitTitle(nodeId, input.value, { skipRender: true }).then(() =>
+      void this.commitTitle(blockId, nodeId, input.value, { skipRender: true }).then(() =>
         this.applyOperation(event.shiftKey ? outdentNode(this.nodes, nodeId) : indentNode(this.nodes, nodeId))
       );
       return;
@@ -714,13 +748,15 @@ class MindmapWorkbenchView extends ItemView {
     }
   }
 
-  private async commitTitle(nodeId: string, title: string, options: { skipRender?: boolean } = {}): Promise<void> {
+  private async commitTitle(blockId: string, nodeId: string, title: string, options: { skipRender?: boolean } = {}): Promise<void> {
+    this.activateBlock(blockId);
     const node = findNode(this.nodes, nodeId);
     if (!node || node.title === title) return;
     await this.applyOperation(updateNodeTitle(this.nodes, nodeId, title), options);
   }
 
-  private selectNode(nodeId: string, additive: boolean): void {
+  private selectNode(blockId: string, nodeId: string, additive: boolean): void {
+    this.activateBlock(blockId);
     if (!additive) this.selectedIds.clear();
     if (additive && this.selectedIds.has(nodeId)) {
       this.selectedIds.delete(nodeId);
@@ -731,7 +767,8 @@ class MindmapWorkbenchView extends ItemView {
     this.render();
   }
 
-  private toggleCollapse(nodeId: string): void {
+  private toggleCollapse(blockId: string, nodeId: string): void {
+    this.activateBlock(blockId);
     if (this.collapsedIds.has(nodeId)) this.collapsedIds.delete(nodeId);
     else this.collapsedIds.add(nodeId);
     this.updateCache();
@@ -780,6 +817,8 @@ class MindmapWorkbenchView extends ItemView {
     );
     if (nextBlock) {
       this.block = nextBlock;
+      this.nodes = nextBlock.nodes;
+      this.blocks = parseMindmapBlocks(next, { sourcePath: this.sourceFile.path, fallbackTitle: this.sourceFile.basename });
       this.plugin.getFileCache(this.sourceFile.path).lastContentHash = nextBlock.contentHash;
     }
     this.scheduleStatePersist();
@@ -798,6 +837,22 @@ class MindmapWorkbenchView extends ItemView {
       await this.app.workspace.getLeaf(false).openFile(file, { active: false });
     }
     await this.loadFileBlock(file, entry.id);
+  }
+
+  private activateBlock(blockId: string): void {
+    if (this.block?.id === blockId) return;
+    const block = this.blocks.find((candidate) => candidate.id === blockId);
+    if (!block) return;
+    this.block = block;
+    this.nodes = block.nodes;
+    const cache = this.sourceFile ? this.plugin.getFileCache(this.sourceFile.path) : null;
+    const previousActiveId = cache?.activeBlockId;
+    const state = this.fileState.blocks[block.id];
+    this.collapsedIds = new Set(previousActiveId === block.id ? cache?.collapsedIds ?? [] : state?.collapsedIds ?? []);
+    this.scale = previousActiveId === block.id ? cache?.scale ?? this.scale : state?.scale ?? this.scale;
+    this.scrollLeft = previousActiveId === block.id ? cache?.scrollLeft ?? 0 : state?.scrollLeft ?? 0;
+    this.scrollTop = previousActiveId === block.id ? cache?.scrollTop ?? 0 : state?.scrollTop ?? 0;
+    if (this.sourceFile) this.plugin.setActiveBlockForFile(this.sourceFile.path, block.id);
   }
 
   private currentFileEntries(): MindmapIndexEntry[] {
