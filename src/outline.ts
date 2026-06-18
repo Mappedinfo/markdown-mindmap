@@ -300,7 +300,7 @@ export function createMindmapId(seed: string): string {
 function findMindmapFences(lines: string[]): BlockCandidate[] {
   const blocks: BlockCandidate[] = [];
   for (let line = 0; line < lines.length; line += 1) {
-    const open = lines[line].match(/^(`{3,}|~{3,})mindmap(?:\s+(.*))?\s*$/);
+    const open = lines[line].match(/^(`{3,}|~{3,})\s*mindmap(?:\s+(.*))?\s*$/);
     if (!open) continue;
     const fence = open[1];
     const fenceChar = fence[0];

@@ -74,6 +74,7 @@ export default class MarkdownMindmapPlugin extends Plugin {
   readonly suppressModifyPaths = new Set<string>();
 
   private vaultScanTimer: number | null = null;
+  private lastMarkdownFilePath: string | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -116,6 +117,7 @@ export default class MarkdownMindmapPlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", () => {
+        this.captureActiveMarkdownFile();
         if (!this.settings.followActiveFile) return;
         this.refreshOpenMindmapViews();
       })
@@ -123,6 +125,7 @@ export default class MarkdownMindmapPlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on("editor-change", () => {
+        this.captureActiveMarkdownFile();
         if (!this.settings.followActiveFile) return;
         this.refreshOpenMindmapViews({ preserveSelection: true, fromEditorChange: true });
       })
@@ -136,6 +139,7 @@ export default class MarkdownMindmapPlugin extends Plugin {
     );
 
     this.app.workspace.onLayoutReady(() => {
+      this.captureActiveMarkdownFile();
       if (this.settings.scanVaultOnOpen) void this.refreshVaultIndex();
     });
   }
@@ -172,21 +176,25 @@ export default class MarkdownMindmapPlugin extends Plugin {
     }
   }
 
-  async createMindmapInCurrentFile(): Promise<void> {
+  async createMindmapInCurrentFile(targetFile?: TFile): Promise<void> {
     const view = this.getActiveMarkdownView();
-    if (!view?.file) {
+    const file = targetFile ?? view?.file ?? this.getActiveMarkdownFile();
+    if (!file) {
       new Notice("Open a Markdown file first.");
       return;
     }
-    const title = view.file.basename || "Mindmap";
-    const id = createMindmapId(`${view.file.path}:${Date.now()}`);
-    const markdown = view.getViewData();
-    const next = insertMindmapBlockAtLine(markdown, view.editor.getCursor().line, { id, title });
-    await this.writeMarkdownFile(view.file, next);
-    this.setActiveBlockForFile(view.file.path, id);
-    await this.refreshIndexForFile(view.file, next);
+    this.lastMarkdownFilePath = file.path;
+    const sourceView = view?.file?.path === file.path ? view : this.findMarkdownViewForFile(file);
+    const title = file.basename || "Mindmap";
+    const id = createMindmapId(`${file.path}:${Date.now()}`);
+    const markdown = sourceView?.getViewData() ?? (await this.app.vault.cachedRead(file));
+    const insertLine = sourceView?.editor.getCursor().line ?? markdown.split("\n").length;
+    const next = insertMindmapBlockAtLine(markdown, insertLine, { id, title });
+    await this.writeMarkdownFile(file, next);
+    this.setActiveBlockForFile(file.path, id);
+    await this.refreshIndexForFile(file, next);
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_MINDMAP)) {
-      if (leaf.view instanceof MindmapWorkbenchView) await leaf.view.loadFileBlock(view.file, id);
+      if (leaf.view instanceof MindmapWorkbenchView) await leaf.view.loadFileBlock(file, id);
     }
   }
 
@@ -196,7 +204,16 @@ export default class MarkdownMindmapPlugin extends Plugin {
 
   getActiveMarkdownFile(): TFile | null {
     const activeMarkdown = this.getActiveMarkdownView();
-    return activeMarkdown?.file ?? this.app.workspace.getActiveFile();
+    if (activeMarkdown?.file) {
+      this.lastMarkdownFilePath = activeMarkdown.file.path;
+      return activeMarkdown.file;
+    }
+    const activeFile = this.app.workspace.getActiveFile();
+    if (activeFile?.extension === "md") {
+      this.lastMarkdownFilePath = activeFile.path;
+      return activeFile;
+    }
+    return this.getLastMarkdownFile();
   }
 
   findMarkdownViewForFile(file: TFile): MarkdownView | null {
@@ -221,6 +238,10 @@ export default class MarkdownMindmapPlugin extends Plugin {
 
   setActiveBlockForFile(filePath: string, blockId: string): void {
     this.getFileCache(filePath).activeBlockId = blockId;
+  }
+
+  rememberMarkdownFile(file: TFile): void {
+    if (file.extension === "md") this.lastMarkdownFilePath = file.path;
   }
 
   getAllIndexEntries(): MindmapIndexEntry[] {
@@ -297,6 +318,22 @@ export default class MarkdownMindmapPlugin extends Plugin {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_MINDMAP)) {
       if (leaf.view instanceof MindmapWorkbenchView) leaf.view.render();
     }
+  }
+
+  private captureActiveMarkdownFile(): void {
+    const activeMarkdown = this.getActiveMarkdownView();
+    if (activeMarkdown?.file) {
+      this.lastMarkdownFilePath = activeMarkdown.file.path;
+      return;
+    }
+    const activeFile = this.app.workspace.getActiveFile();
+    if (activeFile?.extension === "md") this.lastMarkdownFilePath = activeFile.path;
+  }
+
+  private getLastMarkdownFile(): TFile | null {
+    if (!this.lastMarkdownFilePath) return null;
+    const file = this.app.vault.getAbstractFileByPath(this.lastMarkdownFilePath);
+    return file instanceof TFile && file.extension === "md" ? file : null;
   }
 
   private withMindmapView(callback: (view: MindmapWorkbenchView) => void | Promise<void>): void {
@@ -413,6 +450,7 @@ class MindmapWorkbenchView extends ItemView {
 
   private async loadFile(file: TFile, requestedBlockId?: string, options: { preserveSelection?: boolean } = {}): Promise<void> {
     let markdown = await this.plugin.readMarkdownFile(file);
+    this.plugin.rememberMarkdownFile(file);
     markdown = await this.plugin.normalizeMindmapMetadata(file, markdown);
     const blocks = parseMindmapBlocks(markdown, { sourcePath: file.path, fallbackTitle: file.basename });
     await this.plugin.refreshIndexForFile(file, markdown);
@@ -489,7 +527,7 @@ class MindmapWorkbenchView extends ItemView {
     create.type = "button";
     create.addEventListener("click", (event) => {
       event.preventDefault();
-      void this.plugin.createMindmapInCurrentFile();
+      void this.plugin.createMindmapInCurrentFile(this.sourceFile ?? undefined);
     });
 
     const search = container.createEl("input", { cls: "local-mindmap-search" });
@@ -563,7 +601,7 @@ class MindmapWorkbenchView extends ItemView {
       empty.createDiv({ text: "This file has no mindmap block." });
       const button = empty.createEl("button", { text: "Create mindmap in current file" });
       button.type = "button";
-      button.addEventListener("click", () => void this.plugin.createMindmapInCurrentFile());
+      button.addEventListener("click", () => void this.plugin.createMindmapInCurrentFile(this.sourceFile ?? undefined));
       return;
     }
     if (this.nodes.length === 0) {

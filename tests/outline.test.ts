@@ -62,6 +62,13 @@ test("parseMindmapBlocks supports multiple mindmaps in one Markdown file", () =>
   assert.equal(blocks[1].nodes[0].children[0].title, "B1");
 });
 
+test("parseMindmapBlocks accepts a space between fence and mindmap info string", () => {
+  const blocks = parseMindmapBlocks(["``` mindmap", "- map", "```"].join("\n"));
+
+  assert.equal(blocks.length, 1);
+  assert.equal(blocks[0].nodes[0].title, "map");
+});
+
 test("missing mindmap metadata can be normalized without changing content", () => {
   const markdown = ["```mindmap", "- 博士研究", "\t- 问题", "```"].join("\n");
   const next = normalizeMindmapBlockMetadata(markdown, {
