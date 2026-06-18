@@ -1,40 +1,64 @@
 # Markdown Mindmap
 
-Editable mindmap workbench for plain Markdown outline blocks in Obsidian.
+Editable mindmap workbench for explicit Markdown `mindmap` fenced blocks in Obsidian.
 
-## v1 behavior
+## Quick Start
 
-- Source of truth: the current Markdown file.
-- Editable range: the unordered list block under the active cursor.
-- Supported syntax: plain `- item` lists with two-space indentation by default.
-- Unsupported syntax: task lists, ordered lists, tabs, multi-line list items, and indentation jumps.
+1. Open the command palette and run `Open Markdown Mindmap`, or click the ribbon icon.
+2. If the current Markdown file has no mindmap yet, click `Create mindmap in current file`.
+3. Edit either side:
+   - Editing the fenced Markdown block refreshes the mindmap.
+   - Editing nodes in the mindmap writes back to the fenced Markdown block.
 
-## Commands
+## Markdown Format
 
-- `Open Mindmap for Current Outline`
-- `Induce Parent from Selected Nodes`
-- `Focus Mindmap Node`
+Mindmaps are stored directly in the Markdown file:
 
-## Keyboard editing
+````md
+```mindmap id="research" title="博士研究"
+- 博士研究
+	- 研究问题
+	- 文献综述
+	- 实验设计
+```
+````
+
+Notes:
+
+- Only fenced blocks marked as `mindmap` are indexed.
+- Ordinary Markdown lists are ignored.
+- A single Markdown file can contain multiple mindmaps.
+- New content is written with Tab indentation.
+- Old two-space indentation can be read, but newly written content uses Tabs.
+
+## Dashboard
+
+The panel has a left dashboard and a right canvas.
+
+- `Current file` lists mindmaps in the active Markdown file.
+- `Vault` lists indexed mindmaps across the vault.
+- Search filters by title, root node, and file path.
+
+## Keyboard Editing
 
 - `Enter`: create a sibling node after the current node.
 - `Tab`: indent the current node under the previous sibling.
 - `Shift+Tab`: outdent the current node.
 - `Backspace` / `Delete`: delete an empty leaf node.
 
-## Reverse induction
+## Reverse Induction
 
 Select two or more adjacent sibling nodes, then run `Induce Parent from Selected Nodes`.
 The plugin creates a new parent node and moves the selected nodes under it.
 
-## Managed state
+## Managed State
 
 The plugin may append a hidden managed block to the Markdown file:
 
 ```md
-<!-- BEGIN LOCAL-OBSIDIAN-MINDMAP-STATE
+<!-- BEGIN MARKDOWN-MINDMAP-STATE
 {"schemaVersion":1,"blocks":{}}
-END LOCAL-OBSIDIAN-MINDMAP-STATE -->
+END MARKDOWN-MINDMAP-STATE -->
 ```
 
-This block stores UI state only. The outline content remains in Markdown lists.
+This block stores UI state only. The mindmap content remains in the fenced Markdown block.

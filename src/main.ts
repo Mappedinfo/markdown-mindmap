@@ -9,24 +9,26 @@ import {
   PluginSettingTab,
   Setting,
   TFile,
-  WorkspaceLeaf,
-  normalizePath
+  WorkspaceLeaf
 } from "obsidian";
 import {
+  buildMindmapIndex,
+  createMindmapId,
   deleteEmptyNode,
-  hashOutlineBlock,
   indentNode,
   induceParentFromSelected,
+  insertMindmapBlockAtLine,
   insertSiblingAfter,
+  normalizeMindmapBlockMetadata,
   outdentNode,
-  parseOutlineAtLine,
+  parseMindmapBlocks,
   readMindmapState,
-  replaceOutlineBlock,
-  serializeOutline,
+  replaceMindmapBlock,
   updateNodeTitle,
   upsertMindmapStateBlock,
-  type MindmapSettingsData,
-  type OutlineBlock,
+  type MindmapBlock,
+  type MindmapIndexEntry,
+  type MindmapStateData,
   type OutlineNode,
   type OutlineOperationResult
 } from "./outline.ts";
@@ -34,18 +36,28 @@ import {
 const VIEW_TYPE_MINDMAP = "markdown-mindmap-workbench";
 
 interface LocalMindmapSettings {
-  indentUnit: number;
   openInRightSidebar: boolean;
   persistCollapseState: boolean;
-  followActiveOutline: boolean;
+  followActiveFile: boolean;
+  scanVaultOnOpen: boolean;
 }
 
 const DEFAULT_SETTINGS: LocalMindmapSettings = {
-  indentUnit: 2,
   openInRightSidebar: true,
   persistCollapseState: true,
-  followActiveOutline: true
+  followActiveFile: true,
+  scanVaultOnOpen: true
 };
+
+interface FileMindmapCache {
+  activeBlockId?: string;
+  selectedIds: string[];
+  collapsedIds: string[];
+  scale: number;
+  scrollLeft: number;
+  scrollTop: number;
+  lastContentHash?: string;
+}
 
 interface NodeLayout {
   node: OutlineNode;
@@ -55,18 +67,39 @@ interface NodeLayout {
   parentId: string | null;
 }
 
-export default class LocalObsidianMindmapPlugin extends Plugin {
+export default class MarkdownMindmapPlugin extends Plugin {
   settings: LocalMindmapSettings = DEFAULT_SETTINGS;
+  readonly fileCache = new Map<string, FileMindmapCache>();
+  readonly mindmapIndex = new Map<string, MindmapIndexEntry[]>();
+  readonly suppressModifyPaths = new Set<string>();
+
+  private vaultScanTimer: number | null = null;
 
   async onload(): Promise<void> {
     await this.loadSettings();
-    this.addSettingTab(new LocalMindmapSettingTab(this.app, this));
+    this.addSettingTab(new MarkdownMindmapSettingTab(this.app, this));
     this.registerView(VIEW_TYPE_MINDMAP, (leaf) => new MindmapWorkbenchView(leaf, this));
+
+    this.addRibbonIcon("git-fork", "Open Markdown Mindmap", () => {
+      void this.openMindmapPanel();
+    });
+
+    this.addCommand({
+      id: "open-markdown-mindmap",
+      name: "Open Markdown Mindmap",
+      callback: () => this.openMindmapPanel()
+    });
 
     this.addCommand({
       id: "open-current-outline-mindmap",
       name: "Open Mindmap for Current Outline",
-      callback: () => this.openMindmapForCurrentOutline()
+      callback: () => this.openMindmapPanel()
+    });
+
+    this.addCommand({
+      id: "create-mindmap-in-current-file",
+      name: "Create mindmap in current file",
+      callback: () => this.createMindmapInCurrentFile()
     });
 
     this.addCommand({
@@ -83,27 +116,41 @@ export default class LocalObsidianMindmapPlugin extends Plugin {
 
     this.registerEvent(
       this.app.workspace.on("active-leaf-change", () => {
-        if (!this.settings.followActiveOutline) return;
+        if (!this.settings.followActiveFile) return;
         this.refreshOpenMindmapViews();
       })
     );
 
     this.registerEvent(
       this.app.workspace.on("editor-change", () => {
-        if (!this.settings.followActiveOutline) return;
-        this.refreshOpenMindmapViews();
+        if (!this.settings.followActiveFile) return;
+        this.refreshOpenMindmapViews({ preserveSelection: true, fromEditorChange: true });
       })
     );
+
+    this.registerEvent(
+      this.app.vault.on("modify", (file) => {
+        if (!(file instanceof TFile) || file.extension !== "md") return;
+        void this.handleMarkdownFileModified(file);
+      })
+    );
+
+    this.app.workspace.onLayoutReady(() => {
+      if (this.settings.scanVaultOnOpen) void this.refreshVaultIndex();
+    });
   }
 
   onunload(): void {
+    if (this.vaultScanTimer !== null) window.clearTimeout(this.vaultScanTimer);
     this.app.workspace.detachLeavesOfType(VIEW_TYPE_MINDMAP);
   }
 
   async loadSettings(): Promise<void> {
+    const raw = (await this.loadData()) as Partial<LocalMindmapSettings> & { followActiveOutline?: boolean; indentUnit?: number } | null;
     this.settings = {
       ...DEFAULT_SETTINGS,
-      ...(await this.loadData())
+      ...(raw ?? {}),
+      followActiveFile: raw?.followActiveFile ?? raw?.followActiveOutline ?? DEFAULT_SETTINGS.followActiveFile
     };
   }
 
@@ -111,7 +158,7 @@ export default class LocalObsidianMindmapPlugin extends Plugin {
     await this.saveData(this.settings);
   }
 
-  async openMindmapForCurrentOutline(): Promise<void> {
+  async openMindmapPanel(): Promise<void> {
     let leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_MINDMAP)[0];
     if (!leaf) {
       leaf = this.settings.openInRightSidebar
@@ -121,12 +168,35 @@ export default class LocalObsidianMindmapPlugin extends Plugin {
     }
     await this.app.workspace.revealLeaf(leaf);
     if (leaf.view instanceof MindmapWorkbenchView) {
-      await leaf.view.loadFromActiveMarkdown();
+      await leaf.view.loadCurrentFile();
+    }
+  }
+
+  async createMindmapInCurrentFile(): Promise<void> {
+    const view = this.getActiveMarkdownView();
+    if (!view?.file) {
+      new Notice("Open a Markdown file first.");
+      return;
+    }
+    const title = view.file.basename || "Mindmap";
+    const id = createMindmapId(`${view.file.path}:${Date.now()}`);
+    const markdown = view.getViewData();
+    const next = insertMindmapBlockAtLine(markdown, view.editor.getCursor().line, { id, title });
+    await this.writeMarkdownFile(view.file, next);
+    this.setActiveBlockForFile(view.file.path, id);
+    await this.refreshIndexForFile(view.file, next);
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_MINDMAP)) {
+      if (leaf.view instanceof MindmapWorkbenchView) await leaf.view.loadFileBlock(view.file, id);
     }
   }
 
   getActiveMarkdownView(): MarkdownView | null {
     return this.app.workspace.getActiveViewOfType(MarkdownView);
+  }
+
+  getActiveMarkdownFile(): TFile | null {
+    const activeMarkdown = this.getActiveMarkdownView();
+    return activeMarkdown?.file ?? this.app.workspace.getActiveFile();
   }
 
   findMarkdownViewForFile(file: TFile): MarkdownView | null {
@@ -140,18 +210,99 @@ export default class LocalObsidianMindmapPlugin extends Plugin {
     return found;
   }
 
-  private refreshOpenMindmapViews(): void {
+  getFileCache(filePath: string): FileMindmapCache {
+    let cache = this.fileCache.get(filePath);
+    if (!cache) {
+      cache = { selectedIds: [], collapsedIds: [], scale: 1, scrollLeft: 0, scrollTop: 0 };
+      this.fileCache.set(filePath, cache);
+    }
+    return cache;
+  }
+
+  setActiveBlockForFile(filePath: string, blockId: string): void {
+    this.getFileCache(filePath).activeBlockId = blockId;
+  }
+
+  getAllIndexEntries(): MindmapIndexEntry[] {
+    return [...this.mindmapIndex.values()].flat().sort((a, b) => a.filePath.localeCompare(b.filePath) || a.line - b.line);
+  }
+
+  getIndexEntriesForFile(filePath: string): MindmapIndexEntry[] {
+    return this.mindmapIndex.get(filePath) ?? [];
+  }
+
+  async readMarkdownFile(file: TFile): Promise<string> {
+    const view = this.findMarkdownViewForFile(file);
+    return view?.getViewData() ?? this.app.vault.cachedRead(file);
+  }
+
+  async writeMarkdownFile(file: TFile, markdown: string): Promise<void> {
+    this.suppressModifyPaths.add(file.path);
+    const view = this.findMarkdownViewForFile(file);
+    if (view) {
+      replaceWholeEditorData(view.editor, markdown);
+    } else {
+      await this.app.vault.modify(file, markdown);
+    }
+    window.setTimeout(() => this.suppressModifyPaths.delete(file.path), 350);
+  }
+
+  async normalizeMindmapMetadata(file: TFile, markdown: string): Promise<string> {
+    const next = normalizeMindmapBlockMetadata(markdown, {
+      sourcePath: file.path,
+      fallbackTitle: file.basename
+    });
+    if (next === markdown) return markdown;
+    await this.writeMarkdownFile(file, next);
+    await this.refreshIndexForFile(file, next);
+    return next;
+  }
+
+  async refreshVaultIndex(): Promise<void> {
+    if (this.vaultScanTimer !== null) {
+      window.clearTimeout(this.vaultScanTimer);
+      this.vaultScanTimer = null;
+    }
+    const files = this.app.vault.getMarkdownFiles();
+    for (const file of files) {
+      await this.refreshIndexForFile(file);
+    }
+    this.refreshOpenDashboardOnly();
+  }
+
+  async refreshIndexForFile(file: TFile, knownMarkdown?: string): Promise<void> {
+    const markdown = knownMarkdown ?? (await this.readMarkdownFile(file));
+    const entries = buildMindmapIndex(markdown, file.path, file.basename);
+    if (entries.length > 0) this.mindmapIndex.set(file.path, entries);
+    else this.mindmapIndex.delete(file.path);
+  }
+
+  private async handleMarkdownFileModified(file: TFile): Promise<void> {
+    if (this.suppressModifyPaths.has(file.path)) return;
+    await this.refreshIndexForFile(file);
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_MINDMAP)) {
+      if (leaf.view instanceof MindmapWorkbenchView) leaf.view.scheduleMarkdownRefresh(file.path);
+    }
+  }
+
+  private refreshOpenMindmapViews(options: { preserveSelection?: boolean; fromEditorChange?: boolean } = {}): void {
     for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_MINDMAP)) {
       if (leaf.view instanceof MindmapWorkbenchView) {
-        void leaf.view.loadFromActiveMarkdown({ preserveSelection: true });
+        void leaf.view.loadCurrentFile(options);
       }
+    }
+  }
+
+  private refreshOpenDashboardOnly(): void {
+    for (const leaf of this.app.workspace.getLeavesOfType(VIEW_TYPE_MINDMAP)) {
+      if (leaf.view instanceof MindmapWorkbenchView) leaf.view.render();
     }
   }
 
   private withMindmapView(callback: (view: MindmapWorkbenchView) => void | Promise<void>): void {
     const leaf = this.app.workspace.getLeavesOfType(VIEW_TYPE_MINDMAP)[0];
     if (!(leaf?.view instanceof MindmapWorkbenchView)) {
-      new Notice("Open the Mindmap Workbench first.");
+      new Notice("Open the Markdown Mindmap panel first.");
       return;
     }
     void callback(leaf.view);
@@ -160,14 +311,18 @@ export default class LocalObsidianMindmapPlugin extends Plugin {
 
 class MindmapWorkbenchView extends ItemView {
   private sourceFile: TFile | null = null;
-  private block: OutlineBlock | null = null;
+  private block: MindmapBlock | null = null;
   private nodes: OutlineNode[] = [];
   private selectedIds = new Set<string>();
   private collapsedIds = new Set<string>();
   private scale = 1;
+  private scrollLeft = 0;
+  private scrollTop = 0;
+  private searchQuery = "";
   private refreshTimer: number | null = null;
+  private statePersistTimer: number | null = null;
 
-  constructor(leaf: WorkspaceLeaf, private readonly plugin: LocalObsidianMindmapPlugin) {
+  constructor(leaf: WorkspaceLeaf, private readonly plugin: MarkdownMindmapPlugin) {
     super(leaf);
   }
 
@@ -176,7 +331,7 @@ class MindmapWorkbenchView extends ItemView {
   }
 
   getDisplayText(): string {
-    return "Mindmap Workbench";
+    return "Markdown Mindmap";
   }
 
   getIcon(): string {
@@ -185,53 +340,52 @@ class MindmapWorkbenchView extends ItemView {
 
   async onOpen(): Promise<void> {
     this.render();
+    await this.loadCurrentFile();
   }
 
   async onClose(): Promise<void> {
-    if (this.refreshTimer !== null) {
-      window.clearTimeout(this.refreshTimer);
-      this.refreshTimer = null;
-    }
+    if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
+    if (this.statePersistTimer !== null) window.clearTimeout(this.statePersistTimer);
+    await this.persistState();
   }
 
-  scheduleRefresh(): void {
+  scheduleMarkdownRefresh(filePath?: string): void {
+    if (filePath && this.sourceFile?.path !== filePath) {
+      this.render();
+      return;
+    }
     if (this.refreshTimer !== null) window.clearTimeout(this.refreshTimer);
     this.refreshTimer = window.setTimeout(() => {
       this.refreshTimer = null;
-      void this.loadFromActiveMarkdown({ preserveSelection: true });
-    }, 120);
+      void this.refreshCurrentBlockFromMarkdown();
+    }, 180);
   }
 
-  async loadFromActiveMarkdown(options: { preserveSelection?: boolean } = {}): Promise<void> {
-    const view = this.plugin.getActiveMarkdownView();
-    if (!view?.file) {
-      this.sourceFile = null;
-      this.block = null;
-      this.nodes = [];
-      this.render("Open a Markdown file and place the cursor on a plain list item.");
+  async loadCurrentFile(options: { preserveSelection?: boolean; fromEditorChange?: boolean } = {}): Promise<void> {
+    const activeFile = this.plugin.getActiveMarkdownFile();
+    if (!activeFile || activeFile.extension !== "md") {
+      if (!this.sourceFile) this.render("Open a Markdown file or choose a mindmap from the dashboard.");
       return;
     }
-
-    const cursor = view.editor.getCursor();
-    const markdown = view.getViewData();
-    const parsed = parseOutlineAtLine(markdown, cursor.line, { indentUnit: this.plugin.settings.indentUnit });
-    this.sourceFile = view.file;
-    if (!parsed.ok) {
-      this.block = null;
-      this.nodes = [];
-      this.render(parsed.reason);
+    if (options.fromEditorChange && this.sourceFile?.path === activeFile.path) {
+      this.scheduleMarkdownRefresh(activeFile.path);
       return;
     }
+    await this.loadFile(activeFile, undefined, options);
+  }
 
-    const previousSelection = new Set(this.selectedIds);
-    this.block = parsed.block;
-    this.nodes = parsed.block.nodes;
-    const state = readMindmapState(markdown);
-    this.collapsedIds = new Set(state.blocks[parsed.block.blockHash]?.collapsedIds ?? []);
-    this.selectedIds = options.preserveSelection
-      ? new Set([...previousSelection].filter((id) => findNode(this.nodes, id)))
-      : new Set([this.nodes[0]?.id].filter((id): id is string => Boolean(id)));
-    this.render();
+  async loadFileBlock(file: TFile, blockId: string): Promise<void> {
+    await this.loadFile(file, blockId);
+  }
+
+  async promptInduceParent(): Promise<void> {
+    if (this.selectedIds.size < 2) {
+      new Notice("Select at least two adjacent sibling nodes.");
+      return;
+    }
+    new ParentTitleModal(this.app, "归纳", (title) => {
+      void this.applyOperation(induceParentFromSelected(this.nodes, [...this.selectedIds], title || "归纳"));
+    }).open();
   }
 
   focusSelectedNode(): void {
@@ -245,54 +399,194 @@ class MindmapWorkbenchView extends ItemView {
     input?.select();
   }
 
-  async promptInduceParent(): Promise<void> {
-    if (this.selectedIds.size < 2) {
-      new Notice("Select at least two adjacent sibling nodes.");
-      return;
-    }
-    new ParentTitleModal(this.app, "归纳", (title) => {
-      this.applyOperation(induceParentFromSelected(this.nodes, [...this.selectedIds], title || "归纳"));
-    }).open();
-  }
-
-  private render(status?: string): void {
+  render(status?: string): void {
     const { contentEl } = this;
     contentEl.empty();
     contentEl.addClass("local-mindmap-workbench");
 
-    const toolbar = contentEl.createDiv({ cls: "local-mindmap-toolbar" });
-    toolbar.createDiv({
+    const shell = contentEl.createDiv({ cls: "local-mindmap-shell" });
+    const dashboard = shell.createDiv({ cls: "local-mindmap-dashboard" });
+    const main = shell.createDiv({ cls: "local-mindmap-main" });
+    this.renderDashboard(dashboard);
+    this.renderMain(main, status);
+  }
+
+  private async loadFile(file: TFile, requestedBlockId?: string, options: { preserveSelection?: boolean } = {}): Promise<void> {
+    let markdown = await this.plugin.readMarkdownFile(file);
+    markdown = await this.plugin.normalizeMindmapMetadata(file, markdown);
+    const blocks = parseMindmapBlocks(markdown, { sourcePath: file.path, fallbackTitle: file.basename });
+    await this.plugin.refreshIndexForFile(file, markdown);
+
+    this.sourceFile = file;
+    if (blocks.length === 0) {
+      this.block = null;
+      this.nodes = [];
+      this.selectedIds.clear();
+      this.render();
+      return;
+    }
+
+    const cache = this.plugin.getFileCache(file.path);
+    const activeId = requestedBlockId ?? cache.activeBlockId;
+    const block = blocks.find((candidate) => candidate.id === activeId) ?? blocks[0];
+    this.block = block;
+    this.nodes = block.nodes;
+    this.plugin.setActiveBlockForFile(file.path, block.id);
+    const state = readMindmapState(markdown).blocks[block.id];
+    const previousSelection = new Set(this.selectedIds);
+    this.collapsedIds = new Set(cache.activeBlockId === block.id ? cache.collapsedIds : state?.collapsedIds ?? []);
+    this.scale = cache.activeBlockId === block.id ? cache.scale : state?.scale ?? 1;
+    this.scrollLeft = cache.activeBlockId === block.id ? cache.scrollLeft : state?.scrollLeft ?? 0;
+    this.scrollTop = cache.activeBlockId === block.id ? cache.scrollTop : state?.scrollTop ?? 0;
+    this.selectedIds = options.preserveSelection
+      ? new Set([...previousSelection].filter((id) => findNode(this.nodes, id)))
+      : new Set([this.nodes[0]?.id].filter((id): id is string => Boolean(id)));
+    cache.lastContentHash = block.contentHash;
+    this.updateCache();
+    this.render(block.warning);
+  }
+
+  private async refreshCurrentBlockFromMarkdown(): Promise<void> {
+    if (!this.sourceFile) return;
+    const markdown = await this.plugin.readMarkdownFile(this.sourceFile);
+    await this.plugin.refreshIndexForFile(this.sourceFile, markdown);
+    const blocks = parseMindmapBlocks(markdown, { sourcePath: this.sourceFile.path, fallbackTitle: this.sourceFile.basename });
+    if (!this.block) {
+      this.render();
+      return;
+    }
+    const fresh = blocks.find((candidate) => candidate.id === this.block?.id);
+    if (!fresh) {
+      this.block = blocks[0] ?? null;
+      this.nodes = this.block?.nodes ?? [];
+      this.selectedIds = new Set([this.nodes[0]?.id].filter((id): id is string => Boolean(id)));
+      this.render(this.block ? this.block.warning : undefined);
+      return;
+    }
+    if (fresh.contentHash === this.block.contentHash && fresh.warning === this.block.warning) {
+      this.render();
+      return;
+    }
+    this.block = fresh;
+    this.nodes = fresh.nodes;
+    this.selectedIds = new Set([...this.selectedIds].filter((id) => findNode(this.nodes, id)));
+    if (this.selectedIds.size === 0 && this.nodes[0]) this.selectedIds.add(this.nodes[0].id);
+    this.updateCache();
+    this.render(fresh.warning);
+  }
+
+  private renderDashboard(container: HTMLElement): void {
+    const header = container.createDiv({ cls: "local-mindmap-dashboard-header" });
+    header.createDiv({ cls: "local-mindmap-dashboard-title", text: "Mindmaps" });
+    const refresh = header.createEl("button", { cls: "local-mindmap-icon-button", text: "Refresh" });
+    refresh.type = "button";
+    refresh.addEventListener("click", (event) => {
+      event.preventDefault();
+      void this.plugin.refreshVaultIndex();
+    });
+
+    const create = container.createEl("button", { cls: "local-mindmap-create-button", text: "Create mindmap in current file" });
+    create.type = "button";
+    create.addEventListener("click", (event) => {
+      event.preventDefault();
+      void this.plugin.createMindmapInCurrentFile();
+    });
+
+    const search = container.createEl("input", { cls: "local-mindmap-search" });
+    search.type = "search";
+    search.placeholder = "Search mindmaps";
+    search.value = this.searchQuery;
+    search.addEventListener("input", () => {
+      this.searchQuery = search.value;
+      this.render();
+    });
+
+    this.renderEntrySection(container, "Current file", this.currentFileEntries());
+    const query = this.searchQuery.trim().toLowerCase();
+    const allEntries = this.plugin
+      .getAllIndexEntries()
+      .filter((entry) =>
+        !query ||
+        `${entry.title} ${entry.rootTitle} ${entry.filePath}`.toLowerCase().includes(query)
+      )
+      .slice(0, 80);
+    this.renderEntrySection(container, query ? "Search results" : "Vault", allEntries);
+  }
+
+  private renderEntrySection(container: HTMLElement, title: string, entries: MindmapIndexEntry[]): void {
+    const section = container.createDiv({ cls: "local-mindmap-section" });
+    section.createDiv({ cls: "local-mindmap-section-title", text: `${title} (${entries.length})` });
+    if (entries.length === 0) {
+      section.createDiv({ cls: "local-mindmap-section-empty", text: title === "Current file" ? "This file has no mindmap block." : "No mindmaps found." });
+      return;
+    }
+    for (const entry of entries) {
+      const active = this.sourceFile?.path === entry.filePath && this.block?.id === entry.id;
+      const button = section.createEl("button", { cls: active ? "local-mindmap-entry is-active" : "local-mindmap-entry" });
+      button.type = "button";
+      button.createDiv({ cls: "local-mindmap-entry-title", text: entry.title || entry.rootTitle || "Untitled mindmap" });
+      button.createDiv({ cls: "local-mindmap-entry-path", text: `${entry.filePath} · line ${entry.line}` });
+      button.addEventListener("click", (event) => {
+        event.preventDefault();
+        void this.openIndexEntry(entry);
+      });
+    }
+  }
+
+  private renderMain(container: HTMLElement, status?: string): void {
+    const toolbar = container.createDiv({ cls: "local-mindmap-toolbar" });
+    const titleGroup = toolbar.createDiv({ cls: "local-mindmap-heading" });
+    titleGroup.createDiv({
       cls: "local-mindmap-title",
-      text: this.sourceFile ? this.sourceFile.basename : "Mindmap Workbench"
+      text: this.block?.title ?? this.sourceFile?.basename ?? "Markdown Mindmap"
     });
-    toolbar.createDiv({
+    titleGroup.createDiv({
       cls: "local-mindmap-subtitle",
-      text: this.block
-        ? `${this.sourceFile?.path ?? ""} · lines ${this.block.startLine + 1}-${this.block.endLine + 1}`
-        : "Place the cursor on a plain Markdown list item."
+      text: this.block && this.sourceFile
+        ? `${this.sourceFile.path} · lines ${this.block.startLine + 1}-${this.block.endLine + 1}`
+        : this.sourceFile
+          ? `${this.sourceFile.path} · no mindmap block`
+          : "Choose a mindmap or create one in the active file."
     });
-    this.addToolbarButton(toolbar, "Refresh", () => this.loadFromActiveMarkdown());
     this.addToolbarButton(toolbar, "Induce parent", () => this.promptInduceParent(), this.selectedIds.size >= 2);
     this.addToolbarButton(toolbar, "Focus", () => this.focusSelectedNode(), this.selectedIds.size > 0);
-    this.addToolbarButton(toolbar, "-", () => this.setScale(this.scale - 0.1));
-    this.addToolbarButton(toolbar, "+", () => this.setScale(this.scale + 0.1));
+    this.addToolbarButton(toolbar, "-", () => this.setScale(this.scale - 0.1), Boolean(this.block));
+    this.addToolbarButton(toolbar, "+", () => this.setScale(this.scale + 0.1), Boolean(this.block));
 
-    if (status) {
-      contentEl.createDiv({ cls: "local-mindmap-empty", text: status });
+    if (status) container.createDiv({ cls: "local-mindmap-warning", text: status });
+    if (!this.sourceFile) {
+      container.createDiv({ cls: "local-mindmap-empty", text: "Open a Markdown file or choose a mindmap from the dashboard." });
       return;
     }
-    if (!this.block || this.nodes.length === 0) {
-      contentEl.createDiv({ cls: "local-mindmap-empty", text: "No outline block loaded." });
+    if (!this.block) {
+      const empty = container.createDiv({ cls: "local-mindmap-empty" });
+      empty.createDiv({ text: "This file has no mindmap block." });
+      const button = empty.createEl("button", { text: "Create mindmap in current file" });
+      button.type = "button";
+      button.addEventListener("click", () => void this.plugin.createMindmapInCurrentFile());
+      return;
+    }
+    if (this.nodes.length === 0) {
+      container.createDiv({ cls: "local-mindmap-empty", text: "The selected mindmap block is empty." });
       return;
     }
 
-    const stage = contentEl.createDiv({ cls: "local-mindmap-stage" });
+    const stage = container.createDiv({ cls: "local-mindmap-stage" });
+    stage.scrollLeft = this.scrollLeft;
+    stage.scrollTop = this.scrollTop;
+    stage.addEventListener("scroll", () => {
+      this.scrollLeft = stage.scrollLeft;
+      this.scrollTop = stage.scrollTop;
+      this.updateCache();
+      this.scheduleStatePersist();
+    });
+
     const surface = stage.createDiv({ cls: "local-mindmap-surface" });
     surface.style.transform = `scale(${this.scale})`;
     surface.style.transformOrigin = "top left";
     const layouts = layoutNodes(this.nodes, this.collapsedIds);
-    const maxX = Math.max(...layouts.map((entry) => entry.x), 0) + 320;
-    const maxY = Math.max(...layouts.map((entry) => entry.y), 0) + 120;
+    const maxX = Math.max(...layouts.map((entry) => entry.x), 0) + 340;
+    const maxY = Math.max(...layouts.map((entry) => entry.y), 0) + 140;
     surface.style.width = `${maxX}px`;
     surface.style.height = `${maxY}px`;
 
@@ -316,6 +610,11 @@ class MindmapWorkbenchView extends ItemView {
     for (const layout of layouts) {
       this.renderNode(surface, layout);
     }
+
+    window.setTimeout(() => {
+      stage.scrollLeft = this.scrollLeft;
+      stage.scrollTop = this.scrollTop;
+    }, 0);
   }
 
   private renderNode(surface: HTMLElement, layout: NodeLayout): void {
@@ -350,36 +649,37 @@ class MindmapWorkbenchView extends ItemView {
     input.placeholder = "Untitled";
     input.addEventListener("focus", () => {
       this.selectedIds = new Set([node.id]);
+      this.updateCache();
       card.addClass("is-selected");
       select.checked = true;
     });
-    input.addEventListener("blur", () => this.commitTitle(node.id, input.value));
+    input.addEventListener("blur", () => void this.commitTitle(node.id, input.value));
     input.addEventListener("keydown", (event) => this.handleNodeKeydown(event, node.id, input));
   }
 
   private handleNodeKeydown(event: KeyboardEvent, nodeId: string, input: HTMLInputElement): void {
     if (event.key === "Enter") {
       event.preventDefault();
-      this.commitTitle(nodeId, input.value, { skipRender: true });
-      this.applyOperation(insertSiblingAfter(this.nodes, nodeId, ""));
+      void this.commitTitle(nodeId, input.value, { skipRender: true }).then(() => this.applyOperation(insertSiblingAfter(this.nodes, nodeId, "")));
       return;
     }
     if (event.key === "Tab") {
       event.preventDefault();
-      this.commitTitle(nodeId, input.value, { skipRender: true });
-      this.applyOperation(event.shiftKey ? outdentNode(this.nodes, nodeId) : indentNode(this.nodes, nodeId));
+      void this.commitTitle(nodeId, input.value, { skipRender: true }).then(() =>
+        this.applyOperation(event.shiftKey ? outdentNode(this.nodes, nodeId) : indentNode(this.nodes, nodeId))
+      );
       return;
     }
     if ((event.key === "Backspace" || event.key === "Delete") && input.value.trim() === "") {
       event.preventDefault();
-      this.applyOperation(deleteEmptyNode(this.nodes, nodeId));
+      void this.applyOperation(deleteEmptyNode(this.nodes, nodeId));
     }
   }
 
-  private commitTitle(nodeId: string, title: string, options: { skipRender?: boolean } = {}): void {
+  private async commitTitle(nodeId: string, title: string, options: { skipRender?: boolean } = {}): Promise<void> {
     const node = findNode(this.nodes, nodeId);
     if (!node || node.title === title) return;
-    this.applyOperation(updateNodeTitle(this.nodes, nodeId, title), options);
+    await this.applyOperation(updateNodeTitle(this.nodes, nodeId, title), options);
   }
 
   private selectNode(nodeId: string, additive: boolean): void {
@@ -389,72 +689,120 @@ class MindmapWorkbenchView extends ItemView {
     } else {
       this.selectedIds.add(nodeId);
     }
+    this.updateCache();
     this.render();
   }
 
   private toggleCollapse(nodeId: string): void {
     if (this.collapsedIds.has(nodeId)) this.collapsedIds.delete(nodeId);
     else this.collapsedIds.add(nodeId);
+    this.updateCache();
     this.render();
-    void this.persistCollapseState();
+    this.scheduleStatePersist();
   }
 
   private setScale(next: number): void {
     this.scale = Math.min(1.8, Math.max(0.5, Number(next.toFixed(2))));
+    this.updateCache();
     this.render();
+    this.scheduleStatePersist();
   }
 
-  private applyOperation(result: OutlineOperationResult, options: { skipRender?: boolean } = {}): void {
+  private async applyOperation(result: OutlineOperationResult, options: { skipRender?: boolean } = {}): Promise<void> {
     if (!result.ok) {
       new Notice(result.reason);
       return;
     }
     this.nodes = result.nodes;
     this.selectedIds = new Set(result.focusId ? [result.focusId] : [...this.selectedIds].filter((id) => findNode(this.nodes, id)));
-    const written = this.writeNodesToMarkdown();
+    const written = await this.writeNodesToMarkdown();
     if (!written) return;
+    this.updateCache();
     if (!options.skipRender) this.render();
     window.setTimeout(() => this.focusSelectedNode(), 0);
   }
 
-  private writeNodesToMarkdown(): boolean {
+  private async writeNodesToMarkdown(): Promise<boolean> {
     if (!this.sourceFile || !this.block) {
-      new Notice("No source outline block loaded.");
+      new Notice("No source mindmap block loaded.");
       return false;
     }
-    const markdownView = this.plugin.findMarkdownViewForFile(this.sourceFile);
-    const nextBlock = serializeOutline(this.nodes, this.plugin.settings.indentUnit);
-    if (markdownView) {
-      replaceEditorBlock(markdownView.editor, this.block, nextBlock);
-    } else {
-      void this.plugin.app.vault.cachedRead(this.sourceFile).then((markdown) => {
-        const next = replaceOutlineBlock(markdown, this.block!, this.nodes, {
-          indentUnit: this.plugin.settings.indentUnit
-        });
-        return this.plugin.app.vault.modify(this.sourceFile!, next);
-      });
+    const markdown = await this.plugin.readMarkdownFile(this.sourceFile);
+    const blocks = parseMindmapBlocks(markdown, { sourcePath: this.sourceFile.path, fallbackTitle: this.sourceFile.basename });
+    const freshBlock = blocks.find((candidate) => candidate.id === this.block?.id);
+    if (!freshBlock) {
+      new Notice("The source mindmap block no longer exists.");
+      return false;
     }
-    this.block = {
-      ...this.block,
-      endLine: this.block.startLine + nextBlock.split("\n").length - 1,
-      markdown: nextBlock,
-      blockHash: hashOutlineBlock(nextBlock)
-    };
+    const next = replaceMindmapBlock(markdown, freshBlock, this.nodes, freshBlock.title);
+    await this.plugin.writeMarkdownFile(this.sourceFile, next);
+    await this.plugin.refreshIndexForFile(this.sourceFile, next);
+    const nextBlock = parseMindmapBlocks(next, { sourcePath: this.sourceFile.path, fallbackTitle: this.sourceFile.basename }).find(
+      (candidate) => candidate.id === freshBlock.id
+    );
+    if (nextBlock) {
+      this.block = nextBlock;
+      this.plugin.getFileCache(this.sourceFile.path).lastContentHash = nextBlock.contentHash;
+    }
+    this.scheduleStatePersist();
     return true;
   }
 
-  private async persistCollapseState(): Promise<void> {
+  private async openIndexEntry(entry: MindmapIndexEntry): Promise<void> {
+    const file = this.app.vault.getAbstractFileByPath(entry.filePath);
+    if (!(file instanceof TFile)) {
+      new Notice("Mindmap source file no longer exists.");
+      return;
+    }
+    this.plugin.setActiveBlockForFile(file.path, entry.id);
+    const existingView = this.plugin.findMarkdownViewForFile(file);
+    if (!existingView) {
+      await this.app.workspace.getLeaf(false).openFile(file, { active: false });
+    }
+    await this.loadFileBlock(file, entry.id);
+  }
+
+  private currentFileEntries(): MindmapIndexEntry[] {
+    if (!this.sourceFile) return [];
+    return this.plugin.getIndexEntriesForFile(this.sourceFile.path);
+  }
+
+  private updateCache(): void {
+    if (!this.sourceFile || !this.block) return;
+    const cache = this.plugin.getFileCache(this.sourceFile.path);
+    cache.activeBlockId = this.block.id;
+    cache.selectedIds = [...this.selectedIds];
+    cache.collapsedIds = [...this.collapsedIds];
+    cache.scale = this.scale;
+    cache.scrollLeft = this.scrollLeft;
+    cache.scrollTop = this.scrollTop;
+    cache.lastContentHash = this.block.contentHash;
+  }
+
+  private scheduleStatePersist(): void {
+    if (!this.plugin.settings.persistCollapseState) return;
+    if (this.statePersistTimer !== null) window.clearTimeout(this.statePersistTimer);
+    this.statePersistTimer = window.setTimeout(() => {
+      this.statePersistTimer = null;
+      void this.persistState();
+    }, 500);
+  }
+
+  private async persistState(): Promise<void> {
     if (!this.sourceFile || !this.block || !this.plugin.settings.persistCollapseState) return;
-    const markdownView = this.plugin.findMarkdownViewForFile(this.sourceFile);
-    const markdown = markdownView?.getViewData() ?? (await this.plugin.app.vault.cachedRead(this.sourceFile));
-    const state = readMindmapState(markdown);
-    state.blocks[this.block.blockHash] = {
+    const markdown = await this.plugin.readMarkdownFile(this.sourceFile);
+    const state: MindmapStateData = readMindmapState(markdown);
+    state.blocks[this.block.id] = {
       collapsedIds: [...this.collapsedIds],
+      scale: this.scale,
+      scrollLeft: this.scrollLeft,
+      scrollTop: this.scrollTop,
       updatedAt: new Date().toISOString()
     };
     const next = upsertMindmapStateBlock(markdown, state);
     if (next === markdown) return;
-    await this.plugin.app.vault.modify(this.sourceFile, next);
+    await this.plugin.writeMarkdownFile(this.sourceFile, next);
+    await this.plugin.refreshIndexForFile(this.sourceFile, next);
   }
 
   private addToolbarButton(container: HTMLElement, text: string, onClick: () => void | Promise<void>, enabled = true): void {
@@ -502,25 +850,14 @@ class ParentTitleModal extends Modal {
   }
 }
 
-class LocalMindmapSettingTab extends PluginSettingTab {
-  constructor(app: App, private readonly plugin: LocalObsidianMindmapPlugin) {
+class MarkdownMindmapSettingTab extends PluginSettingTab {
+  constructor(app: App, private readonly plugin: MarkdownMindmapPlugin) {
     super(app, plugin);
   }
 
   display(): void {
     const { containerEl } = this;
     containerEl.empty();
-
-    new Setting(containerEl)
-      .setName("Indent unit")
-      .setDesc("Number of spaces used for one outline level.")
-      .addText((text) =>
-        text.setValue(String(this.plugin.settings.indentUnit)).onChange(async (value) => {
-          const parsed = Number(value);
-          this.plugin.settings.indentUnit = Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : DEFAULT_SETTINGS.indentUnit;
-          await this.plugin.saveSettings();
-        })
-      );
 
     new Setting(containerEl)
       .setName("Open in right sidebar")
@@ -532,8 +869,8 @@ class LocalMindmapSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Persist collapse state")
-      .setDesc("Save folded nodes in a hidden managed block at the end of the Markdown file.")
+      .setName("Persist view state")
+      .setDesc("Save collapsed nodes, zoom, and scroll in a hidden managed block in the Markdown file.")
       .addToggle((toggle) =>
         toggle.setValue(this.plugin.settings.persistCollapseState).onChange(async (value) => {
           this.plugin.settings.persistCollapseState = value;
@@ -542,24 +879,31 @@ class LocalMindmapSettingTab extends PluginSettingTab {
       );
 
     new Setting(containerEl)
-      .setName("Follow active outline")
-      .setDesc("Refresh the workbench when the active Markdown cursor changes.")
+      .setName("Follow active file")
+      .setDesc("Keep the panel pointed at the active Markdown file without clearing state on cursor movement.")
       .addToggle((toggle) =>
-        toggle.setValue(this.plugin.settings.followActiveOutline).onChange(async (value) => {
-          this.plugin.settings.followActiveOutline = value;
+        toggle.setValue(this.plugin.settings.followActiveFile).onChange(async (value) => {
+          this.plugin.settings.followActiveFile = value;
+          await this.plugin.saveSettings();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName("Scan vault on open")
+      .setDesc("Build the dashboard index from all Markdown files after Obsidian layout is ready.")
+      .addToggle((toggle) =>
+        toggle.setValue(this.plugin.settings.scanVaultOnOpen).onChange(async (value) => {
+          this.plugin.settings.scanVaultOnOpen = value;
           await this.plugin.saveSettings();
         })
       );
   }
 }
 
-function replaceEditorBlock(editor: Editor, block: OutlineBlock, replacement: string): void {
-  const hasFollowingLine = block.endLine + 1 < editor.lineCount();
-  const from = { line: block.startLine, ch: 0 };
-  const to = hasFollowingLine
-    ? { line: block.endLine + 1, ch: 0 }
-    : { line: block.endLine, ch: editor.getLine(block.endLine).length };
-  editor.replaceRange(hasFollowingLine ? `${replacement}\n` : replacement, from, to);
+function replaceWholeEditorData(editor: Editor, replacement: string): void {
+  const lastLine = Math.max(0, editor.lineCount() - 1);
+  const end = { line: lastLine, ch: editor.getLine(lastLine).length };
+  editor.replaceRange(replacement, { line: 0, ch: 0 }, end);
 }
 
 function layoutNodes(nodes: OutlineNode[], collapsedIds: Set<string>): NodeLayout[] {

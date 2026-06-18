@@ -1,9 +1,9 @@
 {
   "id": "markdown-mindmap",
   "name": "Markdown Mindmap",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "minAppVersion": "1.5.0",
-  "description": "Editable mindmap workbench for Markdown outline blocks.",
+  "description": "Editable mindmap workbench for fenced Markdown mindmap blocks.",
   "author": "mappedinfo",
   "authorUrl": "https://github.com/Mappedinfo",
   "isDesktopOnly": true

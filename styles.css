@@ -9,19 +9,144 @@
   --mindmap-accent-soft: rgba(15, 118, 110, 0.14);
   --mindmap-warning: #b45309;
   height: 100%;
+  background: var(--mindmap-bg);
+}
+
+.local-mindmap-shell {
+  display: grid;
+  grid-template-columns: minmax(220px, 280px) minmax(0, 1fr);
+  height: 100%;
+  min-height: 0;
+}
+
+.local-mindmap-dashboard {
+  border-right: 1px solid var(--mindmap-border);
+  background: var(--mindmap-panel);
+  overflow: auto;
+  padding: 10px;
+}
+
+.local-mindmap-dashboard-header {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 8px;
+  align-items: center;
+  margin-bottom: 10px;
+}
+
+.local-mindmap-dashboard-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: var(--mindmap-strong);
+}
+
+.local-mindmap-create-button,
+.local-mindmap-search,
+.local-mindmap-icon-button,
+.local-mindmap-toolbar button,
+.local-mindmap-collapse {
+  border: 1px solid var(--mindmap-border);
+  border-radius: 6px;
+  background: var(--background-primary);
+  color: var(--text-normal);
+  min-height: 28px;
+  font-size: 12px;
+}
+
+.local-mindmap-create-button {
+  width: 100%;
+  margin-bottom: 8px;
+  padding: 5px 8px;
+  text-align: center;
+}
+
+.local-mindmap-search {
+  width: 100%;
+  margin-bottom: 12px;
+  padding: 4px 8px;
+}
+
+.local-mindmap-icon-button {
+  padding: 4px 8px;
+}
+
+.local-mindmap-section {
+  margin-bottom: 14px;
+}
+
+.local-mindmap-section-title {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--mindmap-muted);
+  text-transform: uppercase;
+  letter-spacing: 0;
+  margin: 0 0 6px;
+}
+
+.local-mindmap-section-empty {
+  color: var(--mindmap-muted);
+  font-size: 12px;
+  line-height: 1.45;
+  padding: 6px 2px;
+}
+
+.local-mindmap-entry {
+  display: block;
+  width: 100%;
+  text-align: left;
+  border: 1px solid transparent;
+  border-radius: 6px;
+  background: transparent;
+  padding: 7px 8px;
+  margin-bottom: 4px;
+  color: var(--text-normal);
+}
+
+.local-mindmap-entry:hover {
+  background: var(--background-modifier-hover);
+}
+
+.local-mindmap-entry.is-active {
+  border-color: var(--mindmap-accent);
+  background: var(--mindmap-accent-soft);
+}
+
+.local-mindmap-entry-title {
+  font-size: 13px;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-mindmap-entry-path {
+  color: var(--mindmap-muted);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.local-mindmap-main {
+  min-width: 0;
+  min-height: 0;
   display: flex;
   flex-direction: column;
-  background: var(--mindmap-bg);
 }
 
 .local-mindmap-toolbar {
   display: grid;
-  grid-template-columns: 1fr auto auto auto auto auto;
+  grid-template-columns: minmax(0, 1fr) auto auto auto auto;
   gap: 8px;
   align-items: center;
   padding: 10px;
   border-bottom: 1px solid var(--mindmap-border);
   background: var(--mindmap-panel);
+}
+
+.local-mindmap-heading {
+  min-width: 0;
 }
 
 .local-mindmap-title {
@@ -35,23 +160,17 @@
 }
 
 .local-mindmap-subtitle {
-  grid-column: 1 / -1;
   font-size: 11px;
   color: var(--mindmap-muted);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  margin-top: 2px;
 }
 
 .local-mindmap-toolbar button,
 .local-mindmap-collapse {
-  border: 1px solid var(--mindmap-border);
-  border-radius: 6px;
-  background: var(--background-primary);
-  color: var(--text-normal);
-  min-height: 28px;
   padding: 4px 9px;
-  font-size: 12px;
 }
 
 .local-mindmap-toolbar button:disabled,
@@ -59,9 +178,22 @@
   opacity: 0.42;
 }
 
+.local-mindmap-warning {
+  margin: 8px 10px 0;
+  padding: 8px 10px;
+  border: 1px solid rgba(180, 83, 9, 0.3);
+  border-left: 4px solid var(--mindmap-warning);
+  border-radius: 6px;
+  color: var(--mindmap-warning);
+  background: rgba(180, 83, 9, 0.08);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
 .local-mindmap-stage {
   position: relative;
   flex: 1;
+  min-height: 0;
   overflow: auto;
   background:
     linear-gradient(var(--background-modifier-border) 1px, transparent 1px),
@@ -154,7 +286,24 @@
   line-height: 1.45;
 }
 
+.local-mindmap-empty button {
+  margin-top: 10px;
+}
+
 .local-mindmap-modal-input {
   width: 100%;
   margin: 8px 0 12px;
+}
+
+@media (max-width: 900px) {
+  .local-mindmap-shell {
+    grid-template-columns: 1fr;
+    grid-template-rows: auto minmax(0, 1fr);
+  }
+
+  .local-mindmap-dashboard {
+    max-height: 220px;
+    border-right: 0;
+    border-bottom: 1px solid var(--mindmap-border);
+  }
 }

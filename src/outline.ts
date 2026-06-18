@@ -1,5 +1,7 @@
-export const MINDMAP_STATE_BEGIN = "<!-- BEGIN LOCAL-OBSIDIAN-MINDMAP-STATE";
-export const MINDMAP_STATE_END = "END LOCAL-OBSIDIAN-MINDMAP-STATE -->";
+export const MARKDOWN_MINDMAP_STATE_BEGIN = "<!-- BEGIN MARKDOWN-MINDMAP-STATE";
+export const MARKDOWN_MINDMAP_STATE_END = "END MARKDOWN-MINDMAP-STATE -->";
+export const LEGACY_MINDMAP_STATE_BEGIN = "<!-- BEGIN LOCAL-OBSIDIAN-MINDMAP-STATE";
+export const LEGACY_MINDMAP_STATE_END = "END LOCAL-OBSIDIAN-MINDMAP-STATE -->";
 
 export interface OutlineNode {
   id: string;
@@ -7,86 +9,150 @@ export interface OutlineNode {
   children: OutlineNode[];
 }
 
-export interface OutlineBlock {
+export interface MindmapBlock {
+  id: string;
+  title: string;
+  rootTitle: string;
   startLine: number;
   endLine: number;
-  markdown: string;
+  contentStartLine: number;
+  contentEndLine: number;
+  rawContent: string;
   nodes: OutlineNode[];
-  blockHash: string;
+  contentHash: string;
+  metadataMissing: boolean;
+  warning?: string;
 }
 
-export type OutlineParseResult =
-  | { ok: true; block: OutlineBlock; warnings: string[] }
-  | { ok: false; reason: string; startLine?: number; endLine?: number };
+export interface MindmapIndexEntry {
+  id: string;
+  title: string;
+  rootTitle: string;
+  filePath: string;
+  line: number;
+  contentHash: string;
+}
 
-export interface MindmapSettingsData {
+export interface MindmapStateData {
   schemaVersion: 1;
-  blocks: Record<string, { collapsedIds: string[]; updatedAt: string }>;
+  blocks: Record<
+    string,
+    {
+      collapsedIds: string[];
+      scale?: number;
+      scrollLeft?: number;
+      scrollTop?: number;
+      updatedAt: string;
+    }
+  >;
 }
 
 export type OutlineOperationResult =
   | { ok: true; nodes: OutlineNode[]; focusId?: string }
   | { ok: false; reason: string };
 
-export function parseOutlineAtLine(
-  markdown: string,
-  cursorLine: number,
-  options: { indentUnit?: number } = {}
-): OutlineParseResult {
-  const indentUnit = options.indentUnit ?? 2;
+interface ParseMindmapOptions {
+  sourcePath?: string;
+  fallbackTitle?: string;
+}
+
+interface BlockCandidate {
+  startLine: number;
+  endLine: number;
+  contentStartLine: number;
+  contentEndLine: number;
+  fence: string;
+  attrs: Record<string, string>;
+  rawAttrs: string;
+  rawContent: string;
+}
+
+export function parseMindmapBlocks(markdown: string, options: ParseMindmapOptions = {}): MindmapBlock[] {
   const normalized = normalizeNewlines(stripMindmapStateBlock(markdown));
   const lines = normalized.split("\n");
-  if (cursorLine < 0 || cursorLine >= lines.length) {
-    return { ok: false, reason: "Cursor is outside the document." };
-  }
-
-  const current = parsePlainListItem(lines[cursorLine], indentUnit);
-  if (!current.ok) {
-    return { ok: false, reason: "Put the cursor on a plain unordered list item (`- item`) first." };
-  }
-
-  const startLine = findListBlockStart(lines, cursorLine);
-  const endLine = findListBlockEnd(lines, cursorLine);
-  const blockLines = lines.slice(startLine, endLine + 1);
-  const parsed = parseOutlineBlockLines(blockLines, indentUnit);
-  if (!parsed.ok) {
-    return { ok: false, reason: parsed.reason, startLine, endLine };
-  }
-
-  const markdownBlock = blockLines.join("\n");
-  return {
-    ok: true,
-    block: {
-      startLine,
-      endLine,
-      markdown: markdownBlock,
-      nodes: parsed.nodes,
-      blockHash: hashOutlineBlock(markdownBlock)
-    },
-    warnings: []
-  };
+  const candidates = findMindmapFences(lines);
+  return candidates.map((candidate, index) => {
+    const parsed = parseOutlineBlockLines(candidate.rawContent.split("\n"));
+    const nodes = parsed.ok ? parsed.nodes : [];
+    const rootTitle = firstRootTitle(nodes);
+    const generatedId = stableMindmapId(options.sourcePath ?? "", index, candidate.rawContent);
+    const id = candidate.attrs.id?.trim() || generatedId;
+    const title = candidate.attrs.title?.trim() || rootTitle || options.fallbackTitle || "Mindmap";
+    return {
+      id,
+      title,
+      rootTitle,
+      startLine: candidate.startLine,
+      endLine: candidate.endLine,
+      contentStartLine: candidate.contentStartLine,
+      contentEndLine: candidate.contentEndLine,
+      rawContent: candidate.rawContent,
+      nodes,
+      contentHash: hashString(candidate.rawContent),
+      metadataMissing: !candidate.attrs.id || !candidate.attrs.title,
+      warning: parsed.ok ? undefined : parsed.reason
+    };
+  });
 }
 
-export function replaceOutlineBlock(
-  markdown: string,
-  block: Pick<OutlineBlock, "startLine" | "endLine">,
-  nodes: OutlineNode[],
-  options: { indentUnit?: number } = {}
-): string {
-  const indentUnit = options.indentUnit ?? 2;
+export function buildMindmapIndex(markdown: string, filePath: string, fallbackTitle?: string): MindmapIndexEntry[] {
+  return parseMindmapBlocks(markdown, { sourcePath: filePath, fallbackTitle }).map((block) => ({
+    id: block.id,
+    title: block.title,
+    rootTitle: block.rootTitle,
+    filePath,
+    line: block.startLine + 1,
+    contentHash: block.contentHash
+  }));
+}
+
+export function normalizeMindmapBlockMetadata(markdown: string, options: ParseMindmapOptions = {}): string {
   const normalized = normalizeNewlines(markdown);
-  const hadFinalNewline = normalized.endsWith("\n");
+  const blocks = parseMindmapBlocks(normalized, options);
+  if (!blocks.some((block) => block.metadataMissing)) return normalized;
+
   const lines = normalized.split("\n");
-  const replacement = serializeOutline(nodes, indentUnit).split("\n");
-  lines.splice(block.startLine, block.endLine - block.startLine + 1, ...replacement);
-  const next = lines.join("\n");
-  return hadFinalNewline && !next.endsWith("\n") ? `${next}\n` : next;
+  for (const block of blocks) {
+    if (!block.metadataMissing) continue;
+    lines[block.startLine] = `\`\`\`mindmap id="${escapeAttribute(block.id)}" title="${escapeAttribute(block.title)}"`;
+  }
+  return restoreFinalNewline(markdown, lines.join("\n"));
 }
 
-export function serializeOutline(nodes: OutlineNode[], indentUnit = 2): string {
+export function replaceMindmapBlock(markdown: string, block: Pick<MindmapBlock, "startLine" | "endLine" | "id" | "title">, nodes: OutlineNode[], title = block.title): string {
+  const normalized = normalizeNewlines(markdown);
+  const lines = normalized.split("\n");
+  const replacement = serializeMindmapBlock({ id: block.id, title }, nodes).split("\n");
+  lines.splice(block.startLine, block.endLine - block.startLine + 1, ...replacement);
+  return restoreFinalNewline(markdown, lines.join("\n"));
+}
+
+export function insertMindmapBlockAtLine(markdown: string, line: number, options: { id: string; title: string; nodes?: OutlineNode[] }): string {
+  const normalized = normalizeNewlines(markdown);
+  const lines = normalized.length > 0 ? normalized.split("\n") : [];
+  const targetLine = Math.max(0, Math.min(line, lines.length));
+  const nodes = options.nodes?.length
+    ? options.nodes
+    : [{ id: "n-0", title: options.title || "Mindmap", children: [] }];
+  const block = serializeMindmapBlock({ id: options.id, title: options.title || "Mindmap" }, nodes);
+  const prefix = targetLine > 0 && lines[targetLine - 1]?.trim() ? [""] : [];
+  const suffix = lines[targetLine]?.trim() ? [""] : [];
+  lines.splice(targetLine, 0, ...prefix, ...block.split("\n"), ...suffix);
+  return restoreFinalNewline(markdown, lines.join("\n"));
+}
+
+export function serializeMindmapBlock(metadata: { id: string; title: string }, nodes: OutlineNode[]): string {
+  return [
+    `\`\`\`mindmap id="${escapeAttribute(metadata.id)}" title="${escapeAttribute(metadata.title)}"`,
+    serializeOutline(nodes),
+    "```"
+  ].join("\n");
+}
+
+export function serializeOutline(nodes: OutlineNode[], indent = "\t"): string {
   const lines: string[] = [];
   const visit = (node: OutlineNode, depth: number) => {
-    lines.push(`${" ".repeat(depth * indentUnit)}- ${node.title}`);
+    lines.push(`${indent.repeat(depth)}- ${node.title}`);
     for (const child of node.children) visit(child, depth + 1);
   };
   for (const node of nodes) visit(node, 0);
@@ -187,14 +253,18 @@ export function induceParentFromSelected(
 }
 
 export function stripMindmapStateBlock(markdown: string): string {
-  return normalizeNewlines(markdown).replace(mindmapStateBlockRegExp(), "").replace(/\n{3,}$/g, "\n\n");
+  return normalizeNewlines(markdown)
+    .replace(mindmapStateBlockRegExp(), "")
+    .replace(legacyMindmapStateBlockRegExp(), "")
+    .replace(/\n{3,}$/g, "\n\n");
 }
 
-export function readMindmapState(markdown: string): MindmapSettingsData {
-  const match = mindmapStateBlockRegExp().exec(normalizeNewlines(markdown));
+export function readMindmapState(markdown: string): MindmapStateData {
+  const normalized = normalizeNewlines(markdown);
+  const match = mindmapStateBlockRegExp().exec(normalized) ?? legacyMindmapStateBlockRegExp().exec(normalized);
   if (!match) return emptyMindmapState();
   try {
-    const parsed = JSON.parse(match[1].trim()) as MindmapSettingsData;
+    const parsed = JSON.parse(match[1].trim()) as MindmapStateData;
     if (parsed.schemaVersion !== 1 || typeof parsed.blocks !== "object" || parsed.blocks === null) {
       return emptyMindmapState();
     }
@@ -204,36 +274,86 @@ export function readMindmapState(markdown: string): MindmapSettingsData {
   }
 }
 
-export function upsertMindmapStateBlock(markdown: string, state: MindmapSettingsData): string {
-  const normalized = normalizeNewlines(markdown).trimEnd();
-  const block = `${MINDMAP_STATE_BEGIN}\n${JSON.stringify(state, null, 2)}\n${MINDMAP_STATE_END}`;
+export function upsertMindmapStateBlock(markdown: string, state: MindmapStateData): string {
+  let normalized = normalizeNewlines(markdown).trimEnd();
+  normalized = normalized.replace(legacyMindmapStateBlockRegExp(), "").trimEnd();
+  const block = `${MARKDOWN_MINDMAP_STATE_BEGIN}\n${JSON.stringify(state, null, 2)}\n${MARKDOWN_MINDMAP_STATE_END}`;
   if (mindmapStateBlockRegExp().test(normalized)) {
     return `${normalized.replace(mindmapStateBlockRegExp(), block)}\n`;
   }
   return `${normalized}\n\n${block}\n`;
 }
 
-export function hashOutlineBlock(markdown: string): string {
+export function hashString(value: string): string {
   let hash = 2166136261;
-  for (const char of normalizeNewlines(markdown)) {
+  for (const char of normalizeNewlines(value)) {
     hash ^= char.charCodeAt(0);
     hash = Math.imul(hash, 16777619);
   }
   return (hash >>> 0).toString(16).padStart(8, "0");
 }
 
+export function createMindmapId(seed: string): string {
+  return `mindmap-${hashString(`${seed}:${Date.now()}`).slice(0, 10)}`;
+}
+
+function findMindmapFences(lines: string[]): BlockCandidate[] {
+  const blocks: BlockCandidate[] = [];
+  for (let line = 0; line < lines.length; line += 1) {
+    const open = lines[line].match(/^(`{3,}|~{3,})mindmap(?:\s+(.*))?\s*$/);
+    if (!open) continue;
+    const fence = open[1];
+    const fenceChar = fence[0];
+    const minFenceLength = fence.length;
+    let closeLine = -1;
+    for (let cursor = line + 1; cursor < lines.length; cursor += 1) {
+      if (new RegExp(`^${escapeRegExp(fenceChar)}{${minFenceLength},}\\s*$`).test(lines[cursor])) {
+        closeLine = cursor;
+        break;
+      }
+    }
+    if (closeLine === -1) continue;
+    const rawAttrs = open[2] ?? "";
+    const contentLines = lines.slice(line + 1, closeLine);
+    blocks.push({
+      startLine: line,
+      endLine: closeLine,
+      contentStartLine: line + 1,
+      contentEndLine: closeLine - 1,
+      fence,
+      attrs: parseAttributes(rawAttrs),
+      rawAttrs,
+      rawContent: contentLines.join("\n")
+    });
+    line = closeLine;
+  }
+  return blocks;
+}
+
+function parseAttributes(rawAttrs: string): Record<string, string> {
+  const attrs: Record<string, string> = {};
+  const regexp = /([A-Za-z_][\w-]*)="([^"]*)"/g;
+  let match: RegExpExecArray | null;
+  while ((match = regexp.exec(rawAttrs)) !== null) {
+    attrs[match[1]] = unescapeAttribute(match[2]);
+  }
+  return attrs;
+}
+
 function parseOutlineBlockLines(
-  blockLines: string[],
-  indentUnit: number
+  blockLines: string[]
 ): { ok: true; nodes: OutlineNode[] } | { ok: false; reason: string } {
+  const meaningfulLines = blockLines.filter((line) => line.trim().length > 0);
+  if (meaningfulLines.length === 0) return { ok: true, nodes: [] };
+
   const roots: OutlineNode[] = [];
   const stack: Array<{ node: OutlineNode; depth: number }> = [];
   let previousDepth = 0;
 
-  for (let lineIndex = 0; lineIndex < blockLines.length; lineIndex += 1) {
-    const parsed = parsePlainListItem(blockLines[lineIndex], indentUnit);
+  for (let lineIndex = 0; lineIndex < meaningfulLines.length; lineIndex += 1) {
+    const parsed = parsePlainListItem(meaningfulLines[lineIndex]);
     if (!parsed.ok) return { ok: false, reason: parsed.reason };
-    if (lineIndex === 0 && parsed.depth !== 0) return { ok: false, reason: "The outline block must start at depth 0." };
+    if (lineIndex === 0 && parsed.depth !== 0) return { ok: false, reason: "The mindmap list must start at depth 0." };
     if (parsed.depth > previousDepth + 1) return { ok: false, reason: "Indentation jumps more than one level." };
     const parent = parsed.depth === 0 ? null : stack[parsed.depth - 1]?.node;
     if (parsed.depth > 0 && !parent) return { ok: false, reason: "Missing parent list item." };
@@ -252,49 +372,24 @@ function parseOutlineBlockLines(
   return { ok: true, nodes: roots };
 }
 
-function parsePlainListItem(
-  line: string,
-  indentUnit: number
-):
+function parsePlainListItem(line: string):
   | { ok: true; depth: number; title: string }
   | { ok: false; reason: string } {
-  if (/^\s*\d+\.\s+/.test(line)) return { ok: false, reason: "Ordered lists are not supported in v1." };
-  const match = line.match(/^(\s*)-\s?(.*)$/);
-  if (!match) return { ok: false, reason: "Only plain unordered list items are supported." };
+  if (/^\s*\d+\.\s+/.test(line)) return { ok: false, reason: "Ordered lists are not supported." };
+  const match = line.match(/^([ \t]*)-\s?(.*)$/);
+  if (!match) return { ok: false, reason: "Only plain unordered list items are supported in mindmap blocks." };
   const indent = match[1];
-  if (indent.includes("\t")) return { ok: false, reason: "Tab indentation is not supported; use spaces." };
-  if (indent.length % indentUnit !== 0) return { ok: false, reason: `Indentation must use ${indentUnit} spaces.` };
+  if (indent.includes("\t") && indent.includes(" ")) return { ok: false, reason: "Do not mix tabs and spaces for mindmap indentation." };
+  let depth = 0;
+  if (indent.includes("\t")) {
+    depth = indent.length;
+  } else {
+    if (indent.length % 2 !== 0) return { ok: false, reason: "Legacy space indentation must use multiples of two spaces." };
+    depth = indent.length / 2;
+  }
   const title = match[2] ?? "";
-  if (/^\[[ xX]\]\s+/.test(title)) return { ok: false, reason: "Task list items are not supported in v1." };
-  return { ok: true, depth: indent.length / indentUnit, title };
-}
-
-function findListBlockStart(lines: string[], cursorLine: number): number {
-  let line = cursorLine;
-  while (line > 0) {
-    const previous = lines[line - 1];
-    if (!previous.trim()) break;
-    if (/^\s*-\s?/.test(previous) || /^\s+\S/.test(previous)) {
-      line -= 1;
-      continue;
-    }
-    break;
-  }
-  return line;
-}
-
-function findListBlockEnd(lines: string[], cursorLine: number): number {
-  let line = cursorLine;
-  while (line + 1 < lines.length) {
-    const next = lines[line + 1];
-    if (!next.trim()) break;
-    if (/^\s*-\s?/.test(next) || /^\s+\S/.test(next)) {
-      line += 1;
-      continue;
-    }
-    break;
-  }
-  return line;
+  if (/^\[[ xX]\]\s+/.test(title)) return { ok: false, reason: "Task list items are not supported in mindmap blocks." };
+  return { ok: true, depth, title };
 }
 
 function findLocation(
@@ -319,12 +414,16 @@ function cloneNodes(nodes: OutlineNode[]): OutlineNode[] {
   }));
 }
 
-function emptyMindmapState(): MindmapSettingsData {
+function emptyMindmapState(): MindmapStateData {
   return { schemaVersion: 1, blocks: {} };
 }
 
-function mindmapStateBlockRegExp(): RegExp {
-  return new RegExp(`${escapeRegExp(MINDMAP_STATE_BEGIN)}\\n([\\s\\S]*?)\\n${escapeRegExp(MINDMAP_STATE_END)}`, "m");
+function stableMindmapId(sourcePath: string, index: number, content: string): string {
+  return `mindmap-${hashString(`${sourcePath}:${index}:${content}`).slice(0, 10)}`;
+}
+
+function firstRootTitle(nodes: OutlineNode[]): string {
+  return nodes[0]?.title?.trim() ?? "";
 }
 
 let generatedIdCounter = 0;
@@ -335,6 +434,26 @@ function createGeneratedNodeId(): string {
 
 function normalizeNewlines(value: string): string {
   return value.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+}
+
+function restoreFinalNewline(original: string, next: string): string {
+  return normalizeNewlines(original).endsWith("\n") && !next.endsWith("\n") ? `${next}\n` : next;
+}
+
+function mindmapStateBlockRegExp(): RegExp {
+  return new RegExp(`${escapeRegExp(MARKDOWN_MINDMAP_STATE_BEGIN)}\\n([\\s\\S]*?)\\n${escapeRegExp(MARKDOWN_MINDMAP_STATE_END)}`, "m");
+}
+
+function legacyMindmapStateBlockRegExp(): RegExp {
+  return new RegExp(`${escapeRegExp(LEGACY_MINDMAP_STATE_BEGIN)}\\n([\\s\\S]*?)\\n${escapeRegExp(LEGACY_MINDMAP_STATE_END)}`, "m");
+}
+
+function escapeAttribute(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+}
+
+function unescapeAttribute(value: string): string {
+  return value.replace(/&quot;/g, '"').replace(/&amp;/g, "&");
 }
 
 function escapeRegExp(value: string): string {
